@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
 import mimetypes
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Iterable
 
+import exifread
 from openrouter import OpenRouter
 from dotenv import load_dotenv
 
@@ -42,9 +43,7 @@ name=Fresh Market
 Output requirements:
 - Return only key=value lines.
 - No markdown, bullets, numbering, or commentary.
-- Deduplicate repeated lines across all photos.
-- Do not guess the address or other information if it is not present in the photos.
-- Do not make up addr:street if it is not present in the photos.
+- Format for phone: +1-555-555-5555 for North American numbers, or +44 20 1234 5678 for international numbers.
 """
 
 
@@ -128,29 +127,55 @@ def response_text(response: object) -> str:
     return str(content)
 
 
-def dedupe_osm_lines(text: str) -> list[str]:
-    seen: set[str] = set()
-    lines: list[str] = []
+def exif_taken_timestamp(image: Path) -> float | None:
+    try:
+        with image.open("rb") as file:
+            tags = exifread.process_file(file, details=False)
+    except OSError:
+        return None
 
-    for raw in text.splitlines():
-        line = raw.strip().lstrip("-* ").strip()
-        if not line or "=" not in line:
+    for tag_name in ("EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"):
+        raw_value = tags.get(tag_name)
+        if not raw_value:
             continue
 
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key or not value:
+        try:
+            parsed = dt.datetime.strptime(str(raw_value), "%Y:%m:%d %H:%M:%S")
+            return parsed.timestamp()
+        except ValueError:
             continue
 
-        normalized = f"{key.lower()}={re.sub(r'\\s+', ' ', value).strip().lower()}"
-        if normalized in seen:
-            continue
+    return None
 
-        seen.add(normalized)
-        lines.append(f"{key}={value}")
 
-    return lines
+def image_timestamp_for_processing(image: Path) -> tuple[float, str]:
+    taken_ts = exif_taken_timestamp(image)
+    if taken_ts is not None:
+        return (taken_ts, "exif")
+    return (image.stat().st_mtime, "filesystem_mtime")
+
+
+def sort_images_for_processing(images: list[Path]) -> list[tuple[Path, float, str]]:
+    image_info: list[tuple[Path, float, str]] = []
+    for image in images:
+        timestamp, source = image_timestamp_for_processing(image)
+        image_info.append((image, timestamp, source))
+
+    # For multi-image runs, process oldest capture first; fall back to mtime then filename.
+    return sorted(image_info, key=lambda item: (item[1], item[0].name.casefold()))
+
+
+def extract_from_image(client: OpenRouter, model: str, image: Path) -> str:
+    content = [
+        {"type": "text", "text": PROMPT},
+        {"type": "image_url", "image_url": {"url": to_data_url(image)}},
+    ]
+    response = client.chat.send(
+        model=model,
+        messages=[{"role": "user", "content": content}],
+        temperature=0,
+    )
+    return response_text(response)
 
 
 def main() -> int:
@@ -167,25 +192,30 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    content = [{"type": "text", "text": PROMPT}]
-    for image in images:
-        content.append({"type": "image_url", "image_url": {"url": to_data_url(image)}})
-
     with OpenRouter(api_key=args.api_key) as client:
-        response = client.chat.send(
-            model=args.model,
-            messages=[{"role": "user", "content": content}],
-            temperature=0,
+        if len(images) == 1:
+            ts, source = image_timestamp_for_processing(images[0])
+            when = dt.datetime.fromtimestamp(ts).isoformat(sep=" ", timespec="seconds")
+            print(
+                f"[1/1] Processing {images[0]} (time={when}, source={source})"
+            )
+            print(extract_from_image(client, args.model, images[0]))
+            return 0
+
+        image_info = sort_images_for_processing(images)
+        print(
+            f"Processing {len(image_info)} images sequentially with model {args.model}."
         )
 
-    print(response_text(response))
+        for index, (image, ts, source) in enumerate(image_info, start=1):
+            when = dt.datetime.fromtimestamp(ts).isoformat(sep=" ", timespec="seconds")
+            print(
+                f"[{index}/{len(image_info)}] Processing {image} (time={when}, source={source})"
+            )
+            output = extract_from_image(client, args.model, image).strip()
+            if output:
+                print(output, flush=True)
 
-    #output_lines = dedupe_osm_lines(response_text(response))
-    #if not output_lines:
-    #    print("No OSM key=value output detected from model response.", file=sys.stderr)
-    #    return 2
-
-    #print("\n".join(output_lines))
     return 0
 
 
